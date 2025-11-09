@@ -19,6 +19,8 @@ class MultiAlphaPPR(PPR):
     :param num_iterations: Number of power iterations for PPR calculation
     :param popularity_weight: Base weight given to item popularity when combining with PPR scores
     :param interaction_weight_processing: Method for processing interaction weights
+    :param continuation_strategy: Strategy used to derive node-dependent continuation probabilities
+    :param exploration_bias: Scaling factor controlling how aggressively the continuation probabilities adapt
     """
 
     def __init__(
@@ -29,6 +31,8 @@ class MultiAlphaPPR(PPR):
         popularity_weight: float = 0.2,
         interaction_weight_processing: Literal["log", "relative"] | None = "log",
         batch_size: int = 1024,
+        continuation_strategy: Literal["fixed", "popularity_adaptive"] = "popularity_adaptive",
+        exploration_bias: float = 0.25,
     ):
         # Validate alpha parameters
         if alphas is None:
@@ -55,6 +59,8 @@ class MultiAlphaPPR(PPR):
             popularity_weight=popularity_weight,
             interaction_weight_processing=interaction_weight_processing,
             batch_size=batch_size,
+            continuation_strategy=continuation_strategy,
+            exploration_bias=exploration_bias,
         )
 
         self.alphas = alphas
@@ -71,25 +77,36 @@ class MultiAlphaPPR(PPR):
 
         :return: Combined PPR scores for all items
         """
-        final_ppr = torch.zeros_like(personalization_vector)
+        if personalization_vector.ndim == 1:
+            personalization = personalization_vector.unsqueeze(0)
+            squeeze_output = True
+        else:
+            personalization = personalization_vector
+            squeeze_output = False
+
+        final_ppr = torch.zeros_like(personalization)
 
         # Calculate PPR for each alpha and combine weighted results
         for alpha, weight in zip(self.alphas, self.alpha_weights, strict=False):
             # Initialize PPR scores with personalization vector
-            ppr = personalization_vector.clone()
+            ppr = personalization.clone()
+            continuation = self._getContinuationForAlpha(alpha).unsqueeze(0)
 
             # Power iteration for current alpha
             for _ in range(self.num_iterations):
-                ppr_next = alpha * (ppr @ self._iu_matrix @ self._ui_matrix) + (1 - alpha) * personalization_vector
+                walk_scores = ppr @ self._iu_matrix @ self._ui_matrix
+                ppr_next = continuation * walk_scores + (1 - continuation) * personalization
 
                 # Check convergence
                 if torch.allclose(ppr, ppr_next, atol=1e-7):
                     self.logger.info(f"Converged after {_ + 1} iterations for alpha {alpha}")
+                    ppr = ppr_next
                     break
-
                 ppr = ppr_next
 
             # Add weighted contribution from current alpha
             final_ppr += weight * ppr
 
+        if squeeze_output:
+            return final_ppr.squeeze(0)
         return final_ppr

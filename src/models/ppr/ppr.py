@@ -16,7 +16,10 @@ class PPR(Recommender):
 
     Constructs a user-item interaction graph and iteratively calculates PPR scores to determine item relevance
     for each user. The final recommendation scores are a combination of the calculated PPR scores and item
-    popularity, adaptively weighted based on the user's interaction history length.
+    popularity, adaptively weighted based on the user's interaction history length. Inspired by recent research on
+    node-dependent restart schemes, the recommender can optionally modulate the random walk continuation
+    probability for every item to bias the walk toward novel (long-tail) content without discarding exploitation
+    signals from popular titles.
 
     :param alpha: teleport probability, higher values emphasize exploration, lower values emphasize exploitation
     :param num_iterations: number of power iterations, more iterations lead to better approximation
@@ -31,9 +34,18 @@ class PPR(Recommender):
         popularity_weight: float = 0.2,
         interaction_weight_processing: Literal["log", "relative"] | None = "log",
         batch_size: int = 1024,
+        continuation_strategy: Literal["fixed", "popularity_adaptive"] = "popularity_adaptive",
+        exploration_bias: float = 0.25,
     ):
         # Validate initialization parameters
-        self._validateInitParameters(alpha, num_iterations, popularity_weight, interaction_weight_processing)
+        self._validateInitParameters(
+            alpha,
+            num_iterations,
+            popularity_weight,
+            interaction_weight_processing,
+            continuation_strategy,
+            exploration_bias,
+        )
 
         super().__init__()
 
@@ -43,6 +55,8 @@ class PPR(Recommender):
         self.interaction_weight_processing = interaction_weight_processing
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.continuation_strategy = continuation_strategy
+        self.exploration_bias = exploration_bias
 
         # Initialize internal mappings and matrices; these will be populated during the fit method
         # Maps original item IDs to internal integer IDs
@@ -57,6 +71,8 @@ class PPR(Recommender):
         self._iu_matrix: torch.Tensor | None = None
         # Precomputed item popularity scores
         self._item_popularity: torch.Tensor | None = None
+        # Node-dependent continuation probabilities used in adaptive restart PPR updates
+        self._continuation_probabilities: torch.Tensor | None = None
 
     @staticmethod
     def _validateInitParameters(
@@ -64,6 +80,8 @@ class PPR(Recommender):
         num_iterations: int,
         popularity_weight: float,
         interaction_weight_processing: str | None,
+        continuation_strategy: str,
+        exploration_bias: float,
     ) -> None:
         """
         Validates initialization parameters for the PPR recommender.
@@ -72,6 +90,8 @@ class PPR(Recommender):
         :param num_iterations: number of power iterations
         :param popularity_weight: base popularity weight
         :param interaction_weight_processing: interaction weight processing method
+        :param continuation_strategy: strategy used to derive node-dependent continuation probabilities
+        :param exploration_bias: scaling factor used by adaptive continuation strategies
         """
         # Validate parameters
         if not 0 <= alpha <= 1:
@@ -82,8 +102,15 @@ class PPR(Recommender):
             raise ValueError(f"num_iterations must be positive, but got {num_iterations}.")
         if interaction_weight_processing not in ["log", "relative", None]:
             raise ValueError(
-                f"interaction_weight_processing must be 'log' or 'relative' or 'None', but got {interaction_weight_processing}."  # noqa: E501
+                f"interaction_weight_processing must be 'log' or 'relative' or 'None', but got {interaction_weight_processing}."
             )
+        if continuation_strategy not in {"fixed", "popularity_adaptive"}:
+            raise ValueError(
+                "continuation_strategy must be 'fixed' or 'popularity_adaptive', "
+                f"but got {continuation_strategy}."
+            )
+        if exploration_bias < 0:
+            raise ValueError(f"exploration_bias must be non-negative, but got {exploration_bias}.")
 
     def _processInteractionWeights(self, df: pd.DataFrame, user_id_column: str, interaction_column: str) -> np.ndarray:
         """
@@ -179,6 +206,60 @@ class PPR(Recommender):
         )
         return ui_matrix
 
+    def _computeContinuationProbabilities(self, log_popularity: np.ndarray) -> torch.Tensor:
+        """
+        Derive item-specific continuation probabilities for the adaptive restart PPR formulation.
+
+        Recent work on node-dependent restart schemes (e.g., Benzi et al., 2015; Lee et al., 2023) shows that
+        adapting restart probabilities according to node importance can substantially improve the discovery of
+        under-exposed items. We follow this idea by constructing continuation probabilities that penalize very
+        popular games and gently boost exploratory mass toward the long tail.
+
+        :param log_popularity: log-scaled item popularity values computed during fitting
+
+        :return: tensor containing continuation probabilities for every item
+        """
+
+        num_items = log_popularity.shape[0]
+        if num_items == 0:
+            raise ValueError("Continuation probabilities cannot be computed without items.")
+
+        if self.continuation_strategy == "fixed":
+            continuation = torch.full((num_items,), float(self.alpha), dtype=torch.float32)
+        else:
+            popularity_tensor = torch.from_numpy(log_popularity).float()
+
+            mean = popularity_tensor.mean()
+            std = popularity_tensor.std(unbiased=False)
+            if std < 1e-8:
+                normalized_popularity = torch.zeros_like(popularity_tensor)
+            else:
+                normalized_popularity = (popularity_tensor - mean) / (std + 1e-8)
+
+            # Tanh keeps adjustments bounded while respecting the sign of the deviation from the mean popularity.
+            adjustment = torch.tanh(normalized_popularity) * float(self.exploration_bias)
+
+            # Encourage restarts on extremely popular items while giving long-tail items more opportunity to surface.
+            continuation = torch.clamp(self.alpha - adjustment, min=1e-3, max=0.999)
+
+            # Keep the global mean close to the original alpha to maintain comparable mixing behaviour.
+            continuation = continuation - continuation.mean() + self.alpha
+            continuation = torch.clamp(continuation, min=1e-3, max=0.999)
+
+        return continuation.to(self.device)
+
+    def _getContinuationForAlpha(self, target_alpha: float) -> torch.Tensor:
+        """Project the base continuation probabilities onto a desired global alpha level."""
+
+        if self._continuation_probabilities is None:
+            raise ValueError("Continuation probabilities are undefined. Ensure fit() has been called.")
+
+        continuation = self._continuation_probabilities
+
+        adjusted = continuation + (float(target_alpha) - float(self.alpha))
+        adjusted = adjusted - adjusted.mean() + float(target_alpha)
+        return torch.clamp(adjusted, min=1e-3, max=0.999)
+
     @staticmethod
     def _normalizeMatrix(matrix: csr_matrix, axis: int, threshold: float = 1e-8) -> csr_matrix:
         """
@@ -259,16 +340,23 @@ class PPR(Recommender):
 
         :return: The calculated PPR scores for all items
         """
+        if personalization_vector.ndim == 1:
+            personalization = personalization_vector.unsqueeze(0)
+            squeeze_output = True
+        else:
+            personalization = personalization_vector
+            squeeze_output = False
+
         # Initialize PPR scores with the personalization vector
-        ppr = personalization_vector.clone()
+        ppr = personalization.clone()
+        continuation = self._getContinuationForAlpha(self.alpha).unsqueeze(0)
 
         # Power iteration
         for _ in range(self.num_iterations):
             # Two-step random walk: item->user->item
             # Apply PPR update rule: PPR_next = alpha * (PPR * IU * UI) + (1 - alpha) * personalization_vector
-            ppr_next = (
-                self.alpha * (ppr @ self._iu_matrix @ self._ui_matrix) + (1 - self.alpha) * personalization_vector
-            )
+            walk_scores = ppr @ self._iu_matrix @ self._ui_matrix
+            ppr_next = continuation * walk_scores + (1 - continuation) * personalization
 
             # Sanity check: ensure that the PPR dimensions remain consistent
             assert ppr_next.shape == ppr.shape, f"PPR shape mismatch, expected {ppr.shape}, got {ppr_next.shape}."
@@ -276,9 +364,11 @@ class PPR(Recommender):
             # Check convergence, by comparing ppr and ppr_next
             if torch.allclose(ppr, ppr_next, atol=1e-7):
                 self.logger.info(f"PPR converged after {_ + 1} iterations.")
+                ppr = ppr_next
                 break
-
             ppr = ppr_next
+        if squeeze_output:
+            return ppr.squeeze(0)
         return ppr
 
     def _batchPPR(self, batch_seed_items: list[list[int]]) -> torch.Tensor:
@@ -465,7 +555,14 @@ class PPR(Recommender):
         raw_popularity = np.array(ui_matrix.sum(axis=0)).flatten()
         log_popularity = np.log1p(raw_popularity)
         # Dampen extreme values using log transformation
-        self._item_popularity = torch.from_numpy(log_popularity / log_popularity.sum()).float().to(self.device)
+        if log_popularity.sum() == 0:
+            popularity_distribution = np.ones_like(log_popularity) / len(log_popularity)
+        else:
+            popularity_distribution = log_popularity / log_popularity.sum()
+        self._item_popularity = torch.from_numpy(popularity_distribution).float().to(self.device)
+
+        # Compute continuation probabilities for adaptive restart behaviour
+        self._continuation_probabilities = self._computeContinuationProbabilities(log_popularity)
 
         # Initialize batch popularity tensor for easy broadcasting
         self._batch_popularity = self._item_popularity.unsqueeze(0)
